@@ -677,6 +677,10 @@ function gsRenderButtons(){
 async function gsSyncAll(only, auto){
   if(!gsLS.get('ib_g_on')) return;
   if(GS.busy){ GS.again = true; return; }
+  if(gsLS.get('ib_backend') !== 'drive' && (!gsLS.get('ib_fb_dburl') || !gsLS.get('ib_g_uid'))){
+    gsSetState('reconnect', 'Firebase project not connected. Open the Google account dialog and click Reconnect Firebase.');
+    return;
+  }
   GS.busy = true; gsSetState('syncing');
   try{
     await LDB.ready;
@@ -729,7 +733,11 @@ function gsSoon(files){
 let gsArmed = false;
 function gsArmReconnect(){
   if(gsArmed) return; gsArmed = true;
-  const h = function(){ document.removeEventListener('pointerdown', h, true); gsArmed = false; gsSyncAll(null, true); };
+  const h = function(e){
+    // Never react to presses inside our own dialogs: the sync re-renders the modal and would swallow the click
+    if(e && e.target && e.target.closest && e.target.closest('#gs-modal,#gs-pick,#gs-db-pick,#ib-auth')) return;
+    document.removeEventListener('pointerdown', h, true); gsArmed = false; gsSyncAll(null, true);
+  };
   document.addEventListener('pointerdown', h, true);
 }
 async function gsSignIn(){
@@ -773,12 +781,13 @@ function gsFillModal(){
   const on = gsLS.get('ib_g_on'), email = gsLS.get('ib_g_email'), last = +gsLS.get('ib_g_last') || 0;
   const btn = 'border:0;border-radius:9px;padding:10px 16px;font:600 13.5px inherit;font-family:inherit;cursor:pointer;';
   let h = '';
+  const fbMissing = !!on && (!gsLS.get('ib_fb_dburl') || !gsLS.get('ib_g_uid'));
   if(on){
     h += '<p style="margin:0 0 6px;color:#8d97b5;font-size:12px;letter-spacing:.6px;text-transform:uppercase;">Signed in</p>';
     h += '<p style="margin:0 0 14px;font-size:16px;font-weight:600;">' + (email || 'Google account') + '</p>';
-    h += '<p style="margin:0 0 18px;color:#aab3cf;font-size:13px;line-height:1.55;">' + 'Your data is saved in your Firebase project (' + gsEsc(gsLS.get('ib_fb_project') || '') + ')' + ' and merged across every device you sign in on.' + (last ? '<br>Last sync: ' + new Date(last).toLocaleString('en-IN') : '') + '</p>';
+    h += '<p style="margin:0 0 18px;color:#aab3cf;font-size:13px;line-height:1.55;">' + (fbMissing ? 'Firebase project is not connected on this device. Click <b>Reconnect Firebase</b> and choose your project.' : 'Your data is saved in your Firebase project (' + gsEsc(gsLS.get('ib_fb_project') || '') + ')' + ' and merged across every device you sign in on.') + (last ? '<br>Last sync: ' + new Date(last).toLocaleString('en-IN') : '') + '</p>';
     if(GS.state === 'error' || GS.state === 'reconnect') h += '<p style="margin:0 0 14px;color:#fca5a5;font-size:13px;">' + (GS.msg || 'Click Sync now to reconnect.') + '</p>';
-    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">Sync now</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button></div>';
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">' + (fbMissing ? 'Reconnect Firebase' : 'Sync now') + '</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button></div>';
   } else {
     h += '<p style="margin:0 0 16px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Sign in with your Google account, then connect a Firebase project you own or are authorized to use. Every customer connects their own project and keeps their data separate.</p>';
     if(!GOOGLE_CLIENT_ID){
@@ -790,14 +799,21 @@ function gsFillModal(){
     if(GS.msg) h += '<p style="margin:0 0 14px;color:#fca5a5;font-size:13px;">' + GS.msg + '</p>';
     h += '<button id="gs-in" style="' + btn + 'background:#fff;color:#1f2937;display:flex;align-items:center;gap:10px;"><svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7a14.5 14.5 0 0 1 0-9.4l-7.9-6.1a24 24 0 0 0 0 21.6l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z"/></svg>Login with Firebase account</button>';
   }
-  el.innerHTML = h;
+  if(el.__h === h) return;
+  el.__h = h; el.innerHTML = h;
   gsWireFbPanel('gm');
   const q = function(id){ return document.getElementById(id); };
   if(q('gs-in')) q('gs-in').onclick = async function(){
     const c = q('gs-cid'); if(c){ gsLS.set('ib_g_client', c.value.trim()); GS.tc = null; }
     try{ GS.msg = ''; await gsSignIn(); }catch(e){ GS.msg = e.message || String(e); gsSetState('out', GS.msg); }
   };
-  if(q('gs-sync')) q('gs-sync').onclick = function(){ gsSyncAll(null, false); };
+  if(q('gs-sync')) q('gs-sync').onclick = async function(){
+    if(!gsLS.get('ib_fb_dburl') || !gsLS.get('ib_g_uid')){
+      try{ GS.msg = ''; await gsSignIn(); }catch(e){ gsSetState('error', e.message || String(e)); }
+      return;
+    }
+    gsSyncAll(null, false);
+  };
   if(q('gs-out')) q('gs-out').onclick = function(){ gsSignOut(); };
 }
 function gsOpenModal(){
