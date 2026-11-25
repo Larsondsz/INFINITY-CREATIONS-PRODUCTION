@@ -383,11 +383,23 @@ async function gsInitClient(){
       if(r.error){ p.rej(new Error(r.error_description || r.error)); return; }
       GS.token = r.access_token; GS.exp = Date.now() + ((+r.expires_in || 3600) - 90) * 1000; p.res(GS.token);
     },
-    error_callback: function(e){ const p = GS.pending; GS.pending = null; if(p) p.rej(new Error((e && (e.message || e.type)) || 'Sign-in cancelled')); }
+    error_callback: function(e){
+      const p = GS.pending; GS.pending = null; if(!p) return;
+      const t = e && e.type;
+      p.rej(new Error(t === 'popup_failed_to_open' ? 'Browser blocked the Google popup. Allow popups for this site (icon in the address bar) and try again.'
+        : t === 'popup_closed' ? 'Google window was closed before sign-in finished. Try again and press Allow on the last Google screen.'
+        : ((e && (e.message || e.type)) || 'Sign-in cancelled')));
+    }
   });
 }
 function gsRequestToken(prompt){
-  return new Promise(function(res, rej){ GS.pending = { res:res, rej:rej }; try{ GS.tc.requestAccessToken({ prompt: prompt }); }catch(e){ GS.pending = null; rej(e); } });
+  return new Promise(function(res, rej){
+    const timer = setTimeout(function(){
+      if(GS.pending){ GS.pending = null; rej(new Error('Google did not return a token. A Google window may be hidden behind this one - finish it (Continue / Allow), or allow popups for this site and try again.')); }
+    }, 120000);
+    GS.pending = { res:function(v){ clearTimeout(timer); res(v); }, rej:function(x){ clearTimeout(timer); rej(x); } };
+    try{ GS.tc.requestAccessToken({ prompt: prompt }); }catch(e){ clearTimeout(timer); GS.pending = null; rej(e); }
+  });
 }
 async function gsEnsureToken(){
   if(GS.token && Date.now() < GS.exp) return GS.token;
@@ -397,7 +409,12 @@ async function gsEnsureToken(){
 async function gsApi(url, opts){
   const t = await gsEnsureToken();
   const o = Object.assign({}, opts || {}); o.headers = Object.assign({}, o.headers || {}, { Authorization: 'Bearer ' + t });
-  const r = await fetch(url, o);
+  const ac = new AbortController(), tm = setTimeout(function(){ ac.abort(); }, 25000);
+  o.signal = ac.signal;
+  let r;
+  try{ r = await fetch(url, o); }
+  catch(fe){ throw new Error(fe && fe.name === 'AbortError' ? 'Google did not answer in 25 seconds (' + url.split('?')[0] + '). Check your internet and try again.' : 'Network error calling Google: ' + (fe && fe.message || fe)); }
+  finally{ clearTimeout(tm); }
   if(r.status === 401){ GS.token = null; throw new Error('Google session expired'); }
   if(!r.ok){
     const tx = await r.text();
@@ -584,7 +601,20 @@ async function fbListProjects(){
   }while(pt);
   return out;
 }
+function gsAskDbUrl(projectId, reason){
+  const v = window.prompt(reason + '\n\nPaste your Realtime Database URL (Firebase Console > Build > Realtime Database > Data tab), e.g.\nhttps://' + projectId + '-default-rtdb.firebaseio.com', '');
+  const u = String(v || '').trim().replace(/\/$/, '');
+  if(!/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.(firebaseio\.com|firebasedatabase\.app)$/i.test(u)) throw new Error(reason);
+  return u;
+}
 async function fbFindDb(project, token){
+  try{ return await fbFindDbAuto(project, token); }
+  catch(e){
+    if(/cancelled/i.test(e && e.message || '')) throw e;
+    return gsAskDbUrl(String(project && project.projectId || ''), (e && e.message) || String(e));
+  }
+}
+async function fbFindDbAuto(project, token){
   // Discover the selected account's actual Realtime Database URL from Firebase,
   // rather than guessing a default URL or probing a hard-coded customer's database.
   const projectNumber = String(project && project.projectNumber || '').trim();
@@ -752,15 +782,21 @@ function gsArmReconnect(){
   };
   document.addEventListener('pointerdown', h, true);
 }
+let gsSteps = [];
 function gsFirebaseStage(message){
   const b = document.getElementById('ib-firebase');
   const span = b && b.querySelector('span');
   if(span) span.textContent = message;
+  gsSteps.push(new Date().toLocaleTimeString('en-IN') + '  ' + message);
+  console.log('[IB sign-in]', message);
+  const box = document.getElementById('ib-steps');
+  if(box){ box.textContent = gsSteps.join('\n'); box.style.display = 'block'; }
 }
 function gsSignIn(){
   // IMPORTANT: requestAccessToken must be called synchronously from the user's
   // click handler. Awaiting gsInitClient() first can lose browser user activation
   // and cause the Google account popup to be blocked or never appear.
+  gsSteps = [];
   if(!GS.tc){
     return Promise.reject(new Error('Google sign-in is still loading. Wait a moment, then click Continue with Firebase again.'));
   }
@@ -885,6 +921,7 @@ function gsBuildAuthScreen(){
     '<button id="ib-drive" type="button" style="'+btn+'background:#fff;color:#1f2937;">'+googleIcon+'<span>Continue with Google</span></button>'+
     '<button id="ib-firebase" type="button" style="'+btn+'background:#6366f1;color:#fff;"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M5.2 17.8 12 2l2.1 4.7-3.8 8.1 4.4-5.2 4.1 8.2H5.2Z"/></svg><span>Continue with Firebase</span></button>'+
     '<p id="ib-err" style="margin:14px 0 0;color:#fca5a5;font-size:13px;line-height:1.5;display:none;"></p>'+
+    '<pre id="ib-steps" style="display:none;margin:12px 0 0;padding:10px;border-radius:9px;background:rgba(0,0,0,.3);color:#8d97b5;font:11.5px/1.6 ui-monospace,monospace;text-align:left;white-space:pre-wrap;"></pre>'+
     '</div><p style="margin:18px 0 0;color:#6b7694;font-size:12px;line-height:1.5;">Google saves to your private Drive app folder. Firebase saves to your selected Firebase project.</p></div>';
   document.body.appendChild(d);
   const drive=document.getElementById('ib-drive'), fb=document.getElementById('ib-firebase'), er=document.getElementById('ib-err');
