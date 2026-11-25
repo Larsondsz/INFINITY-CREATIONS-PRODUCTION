@@ -354,7 +354,9 @@ const LDB = (function(){
    Paste your OAuth Web Client ID below, or enter it once in the Google account window.
    Data goes to the hidden "appDataFolder" of the signed-in Google Drive — only this app can read it. */
 const GOOGLE_CLIENT_ID = '261764191034-hrgvra4mpumt8ffuuatggmrle0cv64uk.apps.googleusercontent.com';
-const GS_SCOPES = 'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.email';
+const GS_SCOPES = 'https://www.googleapis.com/auth/firebase.readonly https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email';
+const GD_SCOPES = 'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.email';
+const GD = { token:null, exp:0, tc:null, pending:null };
 const GS = { token:null, exp:0, tc:null, pending:null, busy:false, again:false, timer:null, state:'out', last:0, msg:'' };
 const gsLS = {
   get:function(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } },
@@ -397,9 +399,73 @@ async function gsApi(url, opts){
   const o = Object.assign({}, opts || {}); o.headers = Object.assign({}, o.headers || {}, { Authorization: 'Bearer ' + t });
   const r = await fetch(url, o);
   if(r.status === 401){ GS.token = null; throw new Error('Google session expired'); }
-  if(!r.ok) throw new Error('Google Drive error ' + r.status + ': ' + (await r.text()).slice(0, 160));
+  if(!r.ok){
+    const tx = await r.text();
+    if(r.status === 403 && /SERVICE_DISABLED|has not been used|is disabled/i.test(tx)) throw new Error('Enable "Firebase Management API" in Google Cloud project ' + gsClientId().split('-')[0] + ' (APIs & Services > Library), wait a minute, then try again.');
+    throw new Error('Google API error ' + r.status + ': ' + tx.slice(0, 160));
+  }
   return r;
 }
+
+async function gdInitClient(){
+  if(GD.tc) return;
+  const id = gsClientId(); if(!id) throw new Error('Google OAuth Client ID is missing.');
+  await gsLoadGIS();
+  GD.tc = google.accounts.oauth2.initTokenClient({
+    client_id:id, scope:GD_SCOPES,
+    callback:function(r){
+      const p=GD.pending; GD.pending=null; if(!p) return;
+      if(r.error){ p.rej(new Error(r.error_description || r.error)); return; }
+      GD.token=r.access_token; GD.exp=Date.now()+((+r.expires_in||3600)-90)*1000; p.res(GD.token);
+    },
+    error_callback:function(e){ const p=GD.pending; GD.pending=null; if(p) p.rej(new Error((e&&(e.message||e.type))||'Google sign-in cancelled')); }
+  });
+}
+function gdRequestToken(prompt){
+  return new Promise(function(res,rej){ GD.pending={res:res,rej:rej}; try{ GD.tc.requestAccessToken({prompt:prompt||''}); }catch(e){ GD.pending=null; rej(e); } });
+}
+async function gdEnsureToken(){
+  if(GD.token && Date.now()<GD.exp) return GD.token;
+  await gdInitClient(); return gdRequestToken('select_account');
+}
+async function gdApi(url,opts){
+  const t=await gdEnsureToken(), o=Object.assign({},opts||{});
+  o.headers=Object.assign({},o.headers||{},{Authorization:'Bearer '+t});
+  const r=await fetch(url,o);
+  if(r.status===401){ GD.token=null; throw new Error('Google Drive session expired. Sign in again.'); }
+  if(!r.ok) throw new Error('Google Drive error '+r.status+': '+(await r.text()).slice(0,160));
+  return r;
+}
+async function gdList(){
+  let files=[],pt='';
+  do{
+    const r=await gdApi('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&pageSize=100&fields=nextPageToken,files(id,name)'+(pt?'&pageToken='+encodeURIComponent(pt):''));
+    const j=await r.json(); files=files.concat(j.files||[]); pt=j.nextPageToken||'';
+  }while(pt);
+  return files;
+}
+async function gdDownload(id){ return (await gdApi('https://www.googleapis.com/drive/v3/files/'+id+'?alt=media')).json(); }
+async function gdUpload(name,id,obj){
+  const body=JSON.stringify(obj);
+  if(id){ await gdApi('https://www.googleapis.com/upload/drive/v3/files/'+id+'?uploadType=media',{method:'PATCH',headers:{'Content-Type':'application/json'},body:body}); return id; }
+  const b='ibb'+Date.now();
+  const mp='--'+b+'\\r\\nContent-Type: application/json; charset=UTF-8\\r\\n\\r\\n'+JSON.stringify({name:name,parents:['appDataFolder']})+'\\r\\n--'+b+'\\r\\nContent-Type: application/json\\r\\n\\r\\n'+body+'\\r\\n--'+b+'--';
+  const r=await gdApi('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',{method:'POST',headers:{'Content-Type':'multipart/related; boundary='+b},body:mp});
+  return (await r.json()).id;
+}
+async function gdSignIn(){
+  await gdInitClient(); await gdRequestToken('select_account');
+  const uj=await (await gdApi('https://www.googleapis.com/oauth2/v3/userinfo')).json();
+  if(!uj.sub) throw new Error('Could not read the selected Google account.');
+  const prev=gsLS.get('ib_g_email');
+  if(prev && prev!==uj.email) Object.keys(localStorage).filter(function(k){return k.indexOf('ib_synced:')===0;}).forEach(gsLS.del);
+  gsLS.set('ib_backend','drive'); gsLS.set('ib_g_on','1'); gsLS.set('ib_g_email',uj.email||'');
+  gsLS.del('ib_fb_project'); gsLS.del('ib_fb_dburl'); gsLS.del('ib_g_uid');
+  gsSetState('syncing'); await gsSyncAll(null,false);
+  if(GS.state!=='ok'){ const m=GS.msg||'Could not connect to Google Drive.'; gsLS.del('ib_g_on'); throw new Error(m); }
+  location.reload();
+}
+
 async function gsList(){
   let files = [], pt = '';
   do{
@@ -417,6 +483,177 @@ async function gsUpload(name, id, obj){
   const r = await gsApi('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', { method:'POST', headers:{ 'Content-Type':'multipart/related; boundary=' + b }, body: mp });
   return (await r.json()).id;
 }
+
+/* ===================== Optional backend: your own Firebase project (Realtime Database) =====================
+   Used only when "Store data in my own Firebase project" is ticked. Same merge logic as Google Drive. */
+const FB = { db:null, auth:null };
+function gsBackendName(){ return 'fbrest'; }
+function gsReady(){ return gsLS.get('ib_backend') === 'drive' ? !!(GD.token && Date.now() < GD.exp) : !!(GS.token && Date.now() < GS.exp); }
+function gsParseFbConfig(raw){
+  raw = String(raw || '');
+  const cfg = {}, re = /["']?([A-Za-z]+)["']?\s*:\s*["']([^"']*)["']/g; let m;
+  while((m = re.exec(raw))) cfg[m[1]] = m[2];
+  if(!cfg.apiKey || !cfg.projectId) throw new Error('Paste your full firebaseConfig (it must contain apiKey and projectId).');
+  if(!cfg.authDomain) cfg.authDomain = cfg.projectId + '.firebaseapp.com';
+  if(!cfg.databaseURL) cfg.databaseURL = 'https://' + cfg.projectId + '-default-rtdb.firebaseio.com';
+  return cfg;
+}
+function fbLoadSdk(){
+  if(window.firebase && firebase.database && firebase.auth) return Promise.resolve();
+  const urls = ['firebase-app-compat.js', 'firebase-auth-compat.js', 'firebase-database-compat.js'].map(function(f){ return 'https://www.gstatic.com/firebasejs/10.13.2/' + f; });
+  return urls.reduce(function(p, u){
+    return p.then(function(){ return new Promise(function(res, rej){
+      const sc = document.createElement('script'); sc.src = u; sc.onload = function(){ res(); };
+      sc.onerror = function(){ rej(new Error('Could not load Firebase. Check your internet connection.')); };
+      document.head.appendChild(sc);
+    }); });
+  }, Promise.resolve());
+}
+async function fbInit(){
+  if(FB.db) return;
+  const cfg = gsParseFbConfig(gsLS.get('ib_fb_config'));
+  await fbLoadSdk();
+  const app = firebase.initializeApp(cfg, 'ib-user');
+  FB.auth = firebase.auth(app); FB.db = firebase.database(app);
+}
+async function fbSignIn(){
+  await fbInit();
+  const r = await FB.auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
+  return r.user;
+}
+async function fbUser(){
+  await fbInit();
+  if(FB.auth.currentUser) return FB.auth.currentUser;
+  const u = await new Promise(function(res){ const un = FB.auth.onAuthStateChanged(function(x){ un(); res(x); }); });
+  if(!u) throw new Error('Session expired - sign in again');
+  return u;
+}
+const fbEnc = function(k){ return String(k).replace(/\./g, '~'); };
+const fbDec = function(k){ return String(k).replace(/~/g, '.'); };
+const GS_FB = {
+  list: async function(){
+    const u = await fbUser();
+    const snap = await FB.db.ref('users/' + u.uid + '/index').get();
+    const v = snap.exists() ? (snap.val() || {}) : {};
+    return Object.keys(v).map(function(k){ return { id: fbDec(k), name: fbDec(k) + '.json' }; });
+  },
+  download: async function(id){
+    const u = await fbUser();
+    const snap = await FB.db.ref('users/' + u.uid + '/data/' + fbEnc(id)).get();
+    return snap.exists() ? JSON.parse(snap.val()) : null;
+  },
+  upload: async function(name, id, obj){
+    const u = await fbUser(), fk = name.replace(/\.json$/, '');
+    await FB.db.ref('users/' + u.uid + '/data/' + fbEnc(fk)).set(JSON.stringify(obj));
+    await FB.db.ref('users/' + u.uid + '/index/' + fbEnc(fk)).set(true);
+    return fk;
+  }
+};
+const GS_DRIVE = { list: function(){ return gdList(); }, download: function(id){ return gdDownload(id); }, upload: function(n, i, o){ return gdUpload(n, i, o); } };
+function gsB(){ return gsLS.get('ib_backend') === 'drive' ? GS_DRIVE : GS_FBR; }
+async function fbrFetch(path, opts, extra){
+  const url = gsLS.get('ib_fb_dburl') || '', uid = gsLS.get('ib_g_uid') || '';
+  if(!url || !uid) throw new Error('Sign in again - choose your Firebase project.');
+  const t = await gsEnsureToken();
+  const r = await fetch(url.replace(/\/$/, '') + '/ib_billing/' + uid + path + '.json?access_token=' + encodeURIComponent(t) + (extra || ''), opts || {});
+  if(r.status === 401){ GS.token = null; throw new Error('Google session expired'); }
+  if(!r.ok) throw new Error('Firebase database error ' + r.status + ': ' + (await r.text()).slice(0, 160));
+  return r;
+}
+const GS_FBR = {
+  list: async function(){
+    const v = (await (await fbrFetch('/index', null, '&shallow=true')).json()) || {};
+    return Object.keys(v).map(function(k){ return { id: fbDec(k), name: fbDec(k) + '.json' }; });
+  },
+  download: async function(id){
+    const v = await (await fbrFetch('/data/' + fbEnc(id))).json();
+    return v ? JSON.parse(v) : null;
+  },
+  upload: async function(name, id, obj){
+    const fk = name.replace(/\.json$/, '');
+    await fbrFetch('/data/' + fbEnc(fk), { method:'PUT', body: JSON.stringify(JSON.stringify(obj)) });
+    await fbrFetch('/index/' + fbEnc(fk), { method:'PUT', body: 'true' });
+    return fk;
+  }
+};
+async function fbListProjects(){
+  let out = [], pt = '';
+  do{
+    const j = await (await gsApi('https://firebase.googleapis.com/v1beta1/projects?pageSize=100' + (pt ? '&pageToken=' + encodeURIComponent(pt) : ''))).json();
+    out = out.concat(j.results || []); pt = j.nextPageToken || '';
+  }while(pt);
+  return out;
+}
+async function fbFindDb(project, token){
+  // Discover the selected account's actual Realtime Database URL from Firebase,
+  // rather than guessing a default URL or probing a hard-coded customer's database.
+  const projectNumber = String(project && project.projectNumber || '').trim();
+  const projectId = String(project && project.projectId || '').trim();
+  if(!projectNumber || !projectId) throw new Error('Firebase did not return the selected project number. Please sign in again.');
+  let url = 'https://firebasedatabase.googleapis.com/v1beta/projects/' + encodeURIComponent(projectNumber) + '/locations/-/instances?pageSize=100';
+  let instances = [], pageToken = '';
+  do{
+    const endpoint = url + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');
+    const r = await fetch(endpoint, { headers:{ Authorization:'Bearer ' + token } });
+    if(!r.ok){
+      const body = await r.text();
+      if(r.status === 403) throw new Error('Google account can see project "' + projectId + '", but cannot list its Realtime Database. Check Realtime Database API access for this account.');
+      throw new Error('Could not find the Realtime Database for "' + projectId + '" (API ' + r.status + '): ' + body.slice(0,140));
+    }
+    const data = await r.json();
+    instances = instances.concat(data.instances || []);
+    pageToken = data.nextPageToken || '';
+  }while(pageToken);
+  instances = instances.filter(function(db){ return db.state === 'ACTIVE' && db.databaseUrl; });
+  if(!instances.length) throw new Error('Project "' + projectId + '" has no active Realtime Database. Create one in Firebase Console → Build → Realtime Database, then reconnect.');
+  if(instances.length === 1) return instances[0].databaseUrl.replace(/\/$/, '');
+  return await gsPickDatabase(instances, projectId);
+}
+function gsPickDatabase(list, projectId){
+  return new Promise(function(res, rej){
+    const d=document.createElement('div'); d.id='gs-db-pick';
+    d.style.cssText='position:fixed;inset:0;z-index:100003;background:rgba(5,8,20,.78);display:grid;place-items:center;padding:20px;font-family:Inter,system-ui,sans-serif;';
+    const rows=list.map(function(db,i){
+      const id=(db.name||'').split('/').pop() || db.databaseUrl;
+      return '<button type="button" data-i="'+i+'" style="display:block;width:100%;text-align:left;margin:0 0 8px;padding:12px 14px;border-radius:11px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e8ecf6;cursor:pointer;font:inherit;"><span style="display:block;font-weight:600;font-size:14px;">'+gsEsc(id)+'</span><span style="display:block;color:#8d97b5;font-size:12px;margin-top:3px;">'+gsEsc(db.databaseUrl)+'</span></button>';
+    }).join('');
+    d.innerHTML='<div style="width:460px;max-width:100%;max-height:85vh;overflow:auto;background:#0f1530;color:#e8ecf6;border:1px solid rgba(255,255,255,.12);border-radius:18px;padding:24px;"><h3 style="margin:0 0 5px;font-size:18px;">Choose your Realtime Database</h3><p style="margin:0 0 14px;color:#aab3cf;font-size:13px;">Project: '+gsEsc(projectId)+'</p>'+rows+'<button type="button" id="gs-db-pick-x" style="margin-top:6px;border:0;background:transparent;color:#8d97b5;font:inherit;cursor:pointer;padding:8px;">Cancel</button></div>';
+    d.addEventListener('click',function(e){ const b=e.target.closest&&e.target.closest('button[data-i]'); if(b){d.remove();res(list[+b.getAttribute('data-i')].databaseUrl.replace(/\/$/,''));} else if(e.target.id==='gs-db-pick-x'){d.remove();rej(new Error('Database selection cancelled.'));} });
+    document.body.appendChild(d);
+  });
+}
+function gsPickProject(list){
+  return new Promise(function(res, rej){
+    const d = document.createElement('div'); d.id = 'gs-pick';
+    d.style.cssText = 'position:fixed;inset:0;z-index:100002;background:rgba(5,8,20,.75);display:grid;place-items:center;padding:20px;font-family:Inter,system-ui,sans-serif;';
+    const rows = list.map(function(p, i){
+      return '<button type="button" data-i="' + i + '" style="display:block;width:100%;text-align:left;margin:0 0 8px;padding:12px 14px;border-radius:11px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e8ecf6;cursor:pointer;font:inherit;"><span style="display:block;font-weight:600;font-size:14.5px;">' + gsEsc(p.displayName || p.projectId) + '</span><span style="display:block;color:#8d97b5;font-size:12px;margin-top:2px;">' + gsEsc(p.projectId) + '</span></button>';
+    }).join('');
+    d.innerHTML = '<div style="width:440px;max-width:100%;max-height:85vh;display:flex;flex-direction:column;background:#0f1530;color:#e8ecf6;border:1px solid rgba(255,255,255,.12);border-radius:18px;padding:24px;box-shadow:0 30px 80px rgba(0,0,0,.55);"><h3 style="margin:0 0 4px;font-size:18px;">Select Firebase project</h3><p style="margin:0 0 14px;color:#8d97b5;font-size:13px;">Choose a Firebase project you own or are authorized to use. Each app user connects their own project; projects are never shared by Infinity Billing.</p><div style="overflow:auto;">' + rows + '</div><button type="button" id="gs-pick-x" style="margin-top:6px;border:0;background:transparent;color:#8d97b5;font:inherit;cursor:pointer;padding:8px;">Cancel</button></div>';
+    d.addEventListener('click', function(e){
+      const b = e.target.closest && e.target.closest('button[data-i]');
+      if(b){ d.remove(); res(list[+b.getAttribute('data-i')]); return; }
+      if(e.target.id === 'gs-pick-x'){ d.remove(); rej(new Error('Project selection cancelled.')); }
+    });
+    document.body.appendChild(d);
+  });
+}
+const gsEsc = function(t){ return String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); };
+function gsFbPanel(p){
+  return '';
+  const on = gsBackendName() === 'firebase', cfg = gsLS.get('ib_fb_config') || '';
+  const css = 'width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:#fff;font:12px ui-monospace,monospace;';
+  return '<label style="display:flex;gap:9px;align-items:center;font-size:13px;color:#cbd5e1;cursor:pointer;margin:12px 0 8px;text-align:left;"><input type="checkbox" id="' + p + '-on"' + (on ? ' checked' : '') + '> Store data in my own Firebase project (instead of Google Drive)</label>' +
+    '<div id="' + p + '-box" style="display:' + (on ? 'block' : 'none') + ';text-align:left;">' +
+    '<textarea id="' + p + '-cfg" rows="7" placeholder="Paste your firebaseConfig here" style="' + css + '">' + gsEsc(cfg) + '</textarea>' +
+    '<p style="margin:8px 0 6px;color:#8d97b5;font-size:12px;line-height:1.6;">Firebase Console → Project settings → Your apps → Web app → copy the config. Then: create a <b>Realtime Database</b>, turn on <b>Authentication → Google</b>, add this site under <b>Authentication → Settings → Authorized domains</b>, and set these Database rules:</p>' +
+    '<pre style="margin:0;padding:10px;border-radius:9px;background:rgba(0,0,0,.35);color:#a5b4fc;font:11.5px ui-monospace,monospace;white-space:pre-wrap;">{ "rules": { "users": { "$uid": {\n  ".read": "$uid === auth.uid",\n  ".write": "$uid === auth.uid" } } } }</pre></div>';
+}
+function gsWireFbPanel(p){
+  const q = function(id){ return document.getElementById(id); }, on = q(p + '-on'); if(!on) return;
+  on.onchange = function(){ gsLS.set('ib_backend', on.checked ? 'firebase' : 'drive'); q(p + '-box').style.display = on.checked ? 'block' : 'none'; FB.db = null; };
+  const c = q(p + '-cfg'); if(c) c.oninput = function(){ gsLS.set('ib_fb_config', c.value); FB.db = null; };
+}
 function gsBanner(text){
   if(document.getElementById('gs-banner')) return;
   const d = document.createElement('div'); d.id = 'gs-banner';
@@ -428,12 +665,12 @@ function gsBanner(text){
 function gsSetState(state, msg){ GS.state = state; GS.msg = msg || ''; gsRenderButtons(); }
 function gsRenderButtons(){
   const email = gsLS.get('ib_g_email');
-  let label = 'Google sign-in';
+  let label = gsLS.get('ib_backend') === 'drive' ? 'Google Drive login' : 'Firebase login';
   if(GS.state === 'syncing') label = 'Syncing…';
   else if(GS.state === 'ok') label = 'Synced';
   else if(GS.state === 'reconnect') label = 'Reconnect Google';
   else if(GS.state === 'error') label = 'Sync problem';
-  else if(email) label = 'Google: ' + email;
+  else if(email) label = (gsLS.get('ib_backend') === 'drive' ? 'Google Drive: ' : 'Firebase: ') + email;
   document.querySelectorAll('.gs-btn .gs-label').forEach(function(el){ el.textContent = label; });
   const m = document.getElementById('gs-modal-body'); if(m) gsFillModal();
 }
@@ -443,7 +680,7 @@ async function gsSyncAll(only, auto){
   GS.busy = true; gsSetState('syncing');
   try{
     await LDB.ready;
-    const files = await gsList(), byName = {};
+    const B = gsB(), files = await B.list(), byName = {};
     files.forEach(function(f){ byName[f.name] = f.id; });
     const names = new Set(LDB.fileKeys().map(function(k){ return k + '.json'; }));
     Object.keys(byName).forEach(function(n){ names.add(n); });
@@ -452,11 +689,11 @@ async function gsSyncAll(only, auto){
       const fk = name.replace(/\.json$/, '');
       if(!/^[\w.-]+$/.test(fk)) continue;
       if(only && !only.has(fk) && byName[name]) continue;
-      const remote = byName[name] ? await gsDownload(byName[name]) : null;
+      const remote = byName[name] ? await B.download(byName[name]) : null;
       const first = !gsLS.get('ib_synced:' + fk);
       const res = await LDB.merge(fk, remote, first);
       const hasData = Object.keys(res.snapshot.entries).length || Object.keys(res.snapshot.tombs).length;
-      if((res.needUpload && hasData) || (!byName[name] && hasData)) byName[name] = await gsUpload(name, byName[name] || null, res.snapshot);
+      if((res.needUpload && hasData) || (!byName[name] && hasData)) byName[name] = await B.upload(name, byName[name] || null, res.snapshot);
       gsLS.set('ib_synced:' + fk, '1');
       if(res.changedLocal) changed.push(fk);
     }
@@ -475,7 +712,7 @@ async function gsSyncAll(only, auto){
     if(mine){ if(!auto){ location.reload(); return; } gsBanner('Updated from your Google account.'); }
   }catch(e){
     console.error('Google sync failed', e);
-    const needLogin = /expired|popup|access_denied|interaction|cancel|closed/i.test(e.message || '');
+    const needLogin = /expired|sign in|popup|access_denied|interaction|cancel|closed/i.test(e.message || '');
     gsSetState(needLogin ? 'reconnect' : 'error', e.message || String(e));
     if(needLogin) gsArmReconnect();
   }finally{
@@ -496,26 +733,36 @@ function gsArmReconnect(){
   document.addEventListener('pointerdown', h, true);
 }
 async function gsSignIn(){
+  const prevEmail = gsLS.get('ib_g_email'), prevProj = gsLS.get('ib_fb_project');
   await gsInitClient();
-  const prev = gsLS.get('ib_g_email');
-  await gsRequestToken(prev ? '' : 'select_account');
-  let email = '';
-  try{ const r = await gsApi('https://www.googleapis.com/oauth2/v3/userinfo'); email = (await r.json()).email || ''; }catch(e){}
-  if(email && prev && prev !== email){ Object.keys(localStorage).filter(function(k){ return k.indexOf('ib_synced:') === 0; }).forEach(gsLS.del); }
-  gsLS.set('ib_g_on', '1'); gsLS.set('ib_g_email', email);
+  await gsRequestToken('select_account');            // Google account chooser popup - pick any account
+  const uj = await (await gsApi('https://www.googleapis.com/oauth2/v3/userinfo')).json();
+  const email = uj.email || '', uid = uj.sub || '';
+  if(!uid) throw new Error('Could not read your Google account.');
+  const projects = await fbListProjects();
+  if(!projects.length) throw new Error('No Firebase project found in ' + email + '. Create one in Firebase Console first.');
+  const selectedProject = await gsPickProject(projects);
+  const pid = selectedProject.projectId;
+  const dbUrl = await fbFindDb(selectedProject, GS.token);
+  if((email && prevEmail && prevEmail !== email) || (prevProj && prevProj !== pid)){ Object.keys(localStorage).filter(function(k){ return k.indexOf('ib_synced:') === 0; }).forEach(gsLS.del); }
+  gsLS.set('ib_fb_project', pid); gsLS.set('ib_fb_dburl', dbUrl); gsLS.set('ib_g_uid', uid);
+  gsLS.set('ib_backend', 'firebase'); gsLS.set('ib_g_on', '1'); gsLS.set('ib_g_email', email);
   gsSetState('syncing');
   await gsSyncAll(null, false);
-  if(GS.state !== 'ok'){ const m = GS.msg || 'Could not connect to Google Drive.'; gsLS.del('ib_g_on'); throw new Error(m); }
+  if(GS.state !== 'ok'){ const m = GS.msg || 'Could not connect to your Firebase database.'; gsLS.del('ib_g_on'); throw new Error(m); }
   location.reload();
 }
 async function gsSignOut(){
   if(!confirm('Sign out? Your data stays safe in your Google account and comes back when you sign in again. Anything not yet synced from this device will be lost.')) return;
-  try{ if(GS.token && Date.now() < GS.exp) await gsSyncAll(null, true); }catch(e){}
+  try{ if(gsReady()) await gsSyncAll(null, true); }catch(e){}
+  try{ if(FB.auth) await FB.auth.signOut(); }catch(e){}
+  FB.db = null; FB.auth = null;
   try{ if(GS.token && window.google) google.accounts.oauth2.revoke(GS.token, function(){}); }catch(e){}
-  GS.token = null; GS.exp = 0; GS.tc = null;
+  try{ if(GD.token && window.google) google.accounts.oauth2.revoke(GD.token, function(){}); }catch(e){}
+  GS.token = null; GS.exp = 0; GS.tc = null; GD.token = null; GD.exp = 0; GD.tc = null;
   try{ await LDB.clearAll(); }catch(e){}
   try{
-    Object.keys(localStorage).filter(function(k){ return k.indexOf('ib_') === 0 && k !== 'ib_g_client'; }).forEach(function(k){ localStorage.removeItem(k); });
+    Object.keys(localStorage).filter(function(k){ return k.indexOf('ib_') === 0 && k !== 'ib_g_client' && k !== 'ib_backend' && k !== 'ib_fb_config'; }).forEach(function(k){ localStorage.removeItem(k); });
     localStorage.removeItem('bp_last_workspace'); sessionStorage.clear();
     indexedDB.databases && indexedDB.databases().then(function(l){ l.forEach(function(d){ if(d.name && d.name.indexOf('bp_') === 0) indexedDB.deleteDatabase(d.name); }); });
   }catch(e){}
@@ -529,20 +776,22 @@ function gsFillModal(){
   if(on){
     h += '<p style="margin:0 0 6px;color:#8d97b5;font-size:12px;letter-spacing:.6px;text-transform:uppercase;">Signed in</p>';
     h += '<p style="margin:0 0 14px;font-size:16px;font-weight:600;">' + (email || 'Google account') + '</p>';
-    h += '<p style="margin:0 0 18px;color:#aab3cf;font-size:13px;line-height:1.55;">Your data is saved to this Google account (private app storage in Drive) and merged across every device you sign in on.' + (last ? '<br>Last sync: ' + new Date(last).toLocaleString('en-IN') : '') + '</p>';
+    h += '<p style="margin:0 0 18px;color:#aab3cf;font-size:13px;line-height:1.55;">' + 'Your data is saved in your Firebase project (' + gsEsc(gsLS.get('ib_fb_project') || '') + ')' + ' and merged across every device you sign in on.' + (last ? '<br>Last sync: ' + new Date(last).toLocaleString('en-IN') : '') + '</p>';
     if(GS.state === 'error' || GS.state === 'reconnect') h += '<p style="margin:0 0 14px;color:#fca5a5;font-size:13px;">' + (GS.msg || 'Click Sync now to reconnect.') + '</p>';
     h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">Sync now</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button></div>';
   } else {
-    h += '<p style="margin:0 0 16px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Sign in with Google to store all your data in your own Google account and use it on any device.</p>';
+    h += '<p style="margin:0 0 16px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Sign in with your Google account, then connect a Firebase project you own or are authorized to use. Every customer connects their own project and keeps their data separate.</p>';
     if(!GOOGLE_CLIENT_ID){
       h += '<label style="display:block;font-size:12px;color:#8d97b5;margin-bottom:6px;">Google OAuth Client ID</label>';
       h += '<input id="gs-cid" type="text" value="' + (gsLS.get('ib_g_client') || '') + '" placeholder="xxxxxxxx.apps.googleusercontent.com" style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:9px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:#fff;font:13px ui-monospace,monospace;margin-bottom:10px;">';
       h += '<p style="margin:0 0 16px;color:#8d97b5;font-size:12px;line-height:1.6;">One-time setup: Google Cloud Console → create a project → enable <b>Google Drive API</b> → OAuth consent screen → Credentials → <b>OAuth client ID (Web application)</b>. Add the address you open this app from under <b>Authorized JavaScript origins</b> (it must be http://localhost or https://…, not a file opened from disk).</p>';
     }
+    h += gsFbPanel('gm');
     if(GS.msg) h += '<p style="margin:0 0 14px;color:#fca5a5;font-size:13px;">' + GS.msg + '</p>';
-    h += '<button id="gs-in" style="' + btn + 'background:#fff;color:#1f2937;display:flex;align-items:center;gap:10px;"><svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7a14.5 14.5 0 0 1 0-9.4l-7.9-6.1a24 24 0 0 0 0 21.6l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z"/></svg>Sign in with Google</button>';
+    h += '<button id="gs-in" style="' + btn + 'background:#fff;color:#1f2937;display:flex;align-items:center;gap:10px;"><svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7a14.5 14.5 0 0 1 0-9.4l-7.9-6.1a24 24 0 0 0 0 21.6l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z"/></svg>Login with Firebase account</button>';
   }
   el.innerHTML = h;
+  gsWireFbPanel('gm');
   const q = function(id){ return document.getElementById(id); };
   if(q('gs-in')) q('gs-in').onclick = async function(){
     const c = q('gs-cid'); if(c){ gsLS.set('ib_g_client', c.value.trim()); GS.tc = null; }
@@ -562,36 +811,36 @@ function gsOpenModal(){
 
 function gsBuildAuthScreen(){
   if(gsLS.get('ib_g_on') || document.getElementById('ib-auth')) return;
-  const d = document.createElement('div'); d.id = 'ib-auth';
-  d.style.cssText = 'position:fixed;inset:0;z-index:99999;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;color:#e8ecf6;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:radial-gradient(900px 500px at 12% -10%,rgba(99,102,241,.28),transparent 60%),radial-gradient(800px 500px at 95% 0%,rgba(20,184,166,.22),transparent 60%),#080c1a;';
-  const idField = GOOGLE_CLIENT_ID ? '' :
-    '<div style="width:100%;margin:0 0 14px;text-align:left;"><label style="display:block;font-size:12px;color:#8d97b5;margin-bottom:6px;">Google OAuth Client ID (one-time setup)</label><input id="ib-cid" type="text" value="' + (gsLS.get('ib_g_client') || '') + '" placeholder="xxxxxxxx.apps.googleusercontent.com" style="width:100%;box-sizing:border-box;padding:11px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:#fff;font:13px ui-monospace,monospace;"></div>';
-  d.innerHTML =
-    '<div style="width:400px;max-width:100%;text-align:center;">' +
-      '<div style="width:64px;height:64px;margin:0 auto 18px;border-radius:18px;background:linear-gradient(135deg,#6366f1,#14b8a6);display:grid;place-items:center;box-shadow:0 12px 34px rgba(99,102,241,.45);"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="19" cy="17" r="2"/></svg></div>' +
-      '<h1 style="margin:0 0 6px;font-size:30px;font-weight:800;letter-spacing:-.8px;">Infinity Billing</h1>' +
-      '<p style="margin:0 0 30px;color:#8d97b5;font-size:14.5px;">GST invoicing, purchases &amp; inventory</p>' +
-      '<div style="background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.025));border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:26px;">' +
-        '<h2 style="margin:0 0 6px;font-size:19px;">Sign in or create account</h2>' +
-        '<p style="margin:0 0 20px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Continue with Google. New here? An account is created automatically, and all your data is saved to your own Google Drive and available on every device.</p>' +
-        idField +
-        '<button id="ib-go" type="button" style="width:100%;border:0;border-radius:11px;padding:13px 16px;background:#fff;color:#1f2937;font:600 15px inherit;font-family:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:11px;"><svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7a14.5 14.5 0 0 1 0-9.4l-7.9-6.1a24 24 0 0 0 0 21.6l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z"/></svg><span id="ib-go-t">Continue with Google</span></button>' +
-        '<p id="ib-err" style="margin:14px 0 0;color:#fca5a5;font-size:13px;line-height:1.5;display:none;"></p>' +
-      '</div>' +
-      '<p style="margin:18px 0 0;color:#6b7694;font-size:12px;line-height:1.5;">We only use a private app folder in your Google Drive. We cannot see your other files.</p>' +
-    '</div>';
+  const d=document.createElement('div'); d.id='ib-auth';
+  d.style.cssText='position:fixed;inset:0;z-index:99999;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;color:#e8ecf6;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:radial-gradient(900px 500px at 12% -10%,rgba(99,102,241,.28),transparent 60%),radial-gradient(800px 500px at 95% 0%,rgba(20,184,166,.22),transparent 60%),#080c1a;';
+  const googleIcon='<svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z"/><path fill="#FBBC05" d="M10.5 28.7a14.5 14.5 0 0 1 0-9.4l-7.9-6.1a24 24 0 0 0 0 21.6l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z"/></svg>';
+  const btn='width:100%;border:0;border-radius:11px;padding:13px 16px;font:600 15px inherit;font-family:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:11px;margin-top:10px;';
+  d.innerHTML='<div style="width:400px;max-width:100%;text-align:center;">'+
+    '<div style="width:64px;height:64px;margin:0 auto 18px;border-radius:18px;background:linear-gradient(135deg,#6366f1,#14b8a6);display:grid;place-items:center;box-shadow:0 12px 34px rgba(99,102,241,.45);"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="19" cy="17" r="2"/></svg></div>'+
+    '<h1 style="margin:0 0 6px;font-size:30px;font-weight:800;letter-spacing:-.8px;">Infinity Billing</h1>'+
+    '<p style="margin:0 0 30px;color:#8d97b5;font-size:14.5px;">GST invoicing, purchases &amp; inventory</p>'+
+    '<div style="background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.025));border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:26px;">'+
+    '<h2 style="margin:0 0 6px;font-size:19px;">Choose sign-in method</h2>'+
+    '<p style="margin:0 0 20px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Use Google Drive or connect your own Firebase project. These are separate sign-ins.</p>'+
+    '<button id="ib-drive" type="button" style="'+btn+'background:#fff;color:#1f2937;">'+googleIcon+'<span>Continue with Google</span></button>'+
+    '<button id="ib-firebase" type="button" style="'+btn+'background:#6366f1;color:#fff;"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M5.2 17.8 12 2l2.1 4.7-3.8 8.1 4.4-5.2 4.1 8.2H5.2Z"/></svg><span>Continue with Firebase</span></button>'+
+    '<p id="ib-err" style="margin:14px 0 0;color:#fca5a5;font-size:13px;line-height:1.5;display:none;"></p>'+
+    '</div><p style="margin:18px 0 0;color:#6b7694;font-size:12px;line-height:1.5;">Google saves to your private Drive app folder. Firebase saves to your selected Firebase project.</p></div>';
   document.body.appendChild(d);
-  const go = document.getElementById('ib-go'), t = document.getElementById('ib-go-t'), er = document.getElementById('ib-err');
-  go.onclick = async function(){
-    const c = document.getElementById('ib-cid');
-    if(c){ gsLS.set('ib_g_client', c.value.trim()); GS.tc = null; }
-    er.style.display = 'none'; go.disabled = true; go.style.opacity = '.7'; t.textContent = 'Signing in…';
-    try{ await gsSignIn(); t.textContent = 'Opening your data…'; }
-    catch(e){ er.textContent = e.message || String(e); er.style.display = 'block'; go.disabled = false; go.style.opacity = '1'; t.textContent = 'Continue with Google'; }
+  const drive=document.getElementById('ib-drive'), fb=document.getElementById('ib-firebase'), er=document.getElementById('ib-err');
+  function busy(b){ drive.disabled=b; fb.disabled=b; drive.style.opacity=b?'.65':'1'; fb.style.opacity=b?'.65':'1'; }
+  drive.onclick=async function(){
+    er.style.display='none'; busy(true); drive.querySelector('span').textContent='Opening Google account…';
+    try{ await gdSignIn(); }catch(e){ er.textContent=e.message||String(e); er.style.display='block'; busy(false); drive.querySelector('span').textContent='Continue with Google'; }
+  };
+  fb.onclick=async function(){
+    er.style.display='none'; busy(true); fb.querySelector('span').textContent='Opening Firebase account…';
+    try{ await gsSignIn(); }catch(e){ er.textContent=e.message||String(e); er.style.display='block'; busy(false); fb.querySelector('span').textContent='Continue with Firebase'; }
   };
 }
 document.addEventListener('click', function(e){ if(e.target.closest && e.target.closest('.gs-btn')) gsOpenModal(); });
 window.addEventListener('DOMContentLoaded', function(){
+  gsInitClient().catch(function(){});
   gsBuildAuthScreen();
   gsRenderButtons();
   LDB.ready.then(async function(){
@@ -603,10 +852,10 @@ window.addEventListener('DOMContentLoaded', function(){
       for(const id of Object.keys(w)){ if(cur[id] !== w[id]) await LDB.ref('ib_meta/workspaces/' + id).set(w[id]); }
     }catch(e){}
     if(gsLS.get('ib_g_on')){
-      gsSetState('reconnect'); gsArmReconnect();
+      if(gsBackendName() === 'firebase') gsSyncAll(null, true); else { gsSetState('reconnect'); gsArmReconnect(); }
       LDB.onChange(function(files){ gsSoon(files); });
-      setInterval(function(){ if(GS.token && Date.now() < GS.exp && !document.hidden) gsSyncAll(null, true); }, 90000);
-      document.addEventListener('visibilitychange', function(){ if(!document.hidden && GS.token && Date.now() < GS.exp) gsSyncAll(null, true); });
+      setInterval(function(){ if(gsReady() && !document.hidden) gsSyncAll(null, true); }, 90000);
+      document.addEventListener('visibilitychange', function(){ if(!document.hidden && gsReady()) gsSyncAll(null, true); });
     }
   });
 });
@@ -1876,7 +2125,7 @@ body.has-bar .set-nav{top:calc(var(--topbar-h) + var(--bp-bar-h) + 22px);}
   <div class="bp-brand">Infinity Billing<small>Workplace</small></div>
   <div class="bp-seg" id="bp-seg"></div>
   <span class="bp-sp"></span>
-  <button class="bp-home gs-btn" id="bp-google" type="button" title="Sign in with Google to store data in your Google account"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4 4 0 0 1-.5-7.97A6 6 0 0 1 18 9.5a4.25 4.25 0 0 1-.5 8.5H7z"/></svg><span class="gs-label">Google sign-in</span></button>
+  <button class="bp-home gs-btn" id="bp-google" type="button" title="Login with your Firebase account to store data in your Firebase project"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4 4 0 0 1-.5-7.97A6 6 0 0 1 18 9.5a4.25 4.25 0 0 1-.5 8.5H7z"/></svg><span class="gs-label">Google sign-in</span></button>
   <button class="bp-home" id="bp-home" type="button" title="Back to workplace selection"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Workplaces</span></button>
 </div>
 
