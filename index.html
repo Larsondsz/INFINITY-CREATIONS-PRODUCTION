@@ -593,6 +593,68 @@ const GS_FBR = {
     return fk;
   }
 };
+/* ===================== One-time import from the old "Billing Suite" (Firebase node /companies) =====================
+   Copies companies/<id>/data from the connected Firebase project into this app as separate workplaces.
+   The old data is only READ, never changed. */
+async function ibLegacyRaw(path, extra){
+  const url = gsLS.get('ib_fb_dburl') || '';
+  if(!url) throw new Error('Firebase project is not connected. Click Reconnect Firebase first.');
+  const t = await gsEnsureToken();
+  const r = await fetch(url.replace(/\/$/, '') + '/' + path + '.json?access_token=' + encodeURIComponent(t) + (extra || ''));
+  if(r.status === 401){ GS.token = null; throw new Error('Google session expired - click Sync now, then try again.'); }
+  if(!r.ok) throw new Error('Firebase error ' + r.status + ': ' + (await r.text()).slice(0, 160));
+  return r.json();
+}
+function ibLegacyGuessName(id){
+  if(/kelvin/i.test(id)) return 'Kelvin Warehousing';
+  if(/leco/i.test(id)) return 'LECO Engineering';
+  if(/^bn|[-_]bn/i.test(id)) return 'BN Engineering';
+  return id;
+}
+async function ibImportLegacy(btn){
+  const label = btn ? btn.textContent : '';
+  const say = function(m){ if(btn) btn.textContent = m; };
+  try{
+    await LDB.ready;
+    say('Looking for old data…');
+    const ids = Object.keys((await ibLegacyRaw('companies', '&shallow=true')) || {}).filter(function(i){ return /^[\w.-]+$/.test(i); });
+    if(!ids.length){ alert('No old data found in the "companies" node of this Firebase project.\n\nMake sure you selected the same Firebase project the old app used.'); return; }
+    if(!confirm('Found old workplaces: ' + ids.join(', ') + '\n\nCopy them into Infinity Billing? Your old data stays untouched.')) return;
+    let names = {}; try{ names = JSON.parse(gsLS.get('ib_workspaces') || '{}') || {}; }catch(e){}
+    if(!Object.keys(names).length) names = { 'workplace-1': 'My Workplace' };
+    const done = [];
+    for(const id of ids){
+      say('Reading ' + id + '…');
+      const node = await ibLegacyRaw('companies/' + encodeURIComponent(id));
+      if(!node || typeof node !== 'object') continue;
+      const data = (node.data && typeof node.data === 'object') ? node.data : node;
+      const keys = Object.keys(data); if(!keys.length) continue;
+      const have = await LDB.ref('companies/' + id + '/data').get();
+      if(have.exists() && !confirm('"' + id + '" already has data in this app. Replace it with the old copy?')) continue;
+      const nm = (prompt('Name for old workplace "' + id + '":', names[id] || ibLegacyGuessName(id)) || '').trim();
+      if(!nm) continue;
+      for(let i = 0; i < keys.length; i++){
+        say('Copying ' + nm + ' (' + (i + 1) + '/' + keys.length + ')…');
+        await LDB.ref('companies/' + id + '/data/' + keys[i]).set(data[keys[i]]);
+      }
+      names[id] = nm;
+      await LDB.ref('ib_meta/workspaces/' + id).set(nm);
+      done.push(nm);
+    }
+    if(!done.length){ alert('Nothing was imported.'); return; }
+    gsLS.set('ib_workspaces', JSON.stringify(names));
+    say('Uploading to your account…');
+    await gsSyncAll(null, false);
+    alert('Imported: ' + done.join(', ') + '\n\nThe page will reload now.');
+    try{ sessionStorage.setItem('bp_stay_picker', '1'); sessionStorage.removeItem('bp_workspace'); }catch(e){}
+    location.reload();
+  }catch(e){
+    console.error('Legacy import failed', e);
+    alert('Import failed: ' + (e.message || e));
+  }finally{
+    say(label);
+  }
+}
 async function fbListProjects(){
   let out = [], pt = '';
   do{
@@ -867,7 +929,7 @@ function gsFillModal(){
     h += '<p style="margin:0 0 14px;font-size:16px;font-weight:600;">' + (email || 'Google account') + '</p>';
     h += '<p style="margin:0 0 18px;color:#aab3cf;font-size:13px;line-height:1.55;">' + (fbMissing ? 'Firebase project is not connected on this device. Click <b>Reconnect Firebase</b> and choose your project.' : 'Your data is saved in your Firebase project (' + gsEsc(gsLS.get('ib_fb_project') || '') + ')' + ' and merged across every device you sign in on.') + (last ? '<br>Last sync: ' + new Date(last).toLocaleString('en-IN') : '') + '</p>';
     if(GS.state === 'error' || GS.state === 'reconnect') h += '<p style="margin:0 0 14px;color:#fca5a5;font-size:13px;">' + (GS.msg || 'Click Sync now to reconnect.') + '</p>';
-    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">' + (fbMissing ? 'Reconnect Firebase' : 'Sync now') + '</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button></div>';
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">' + (fbMissing ? 'Reconnect Firebase' : 'Sync now') + '</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button>' + (fbMissing ? '' : '<button id="gs-imp" style="' + btn + 'background:rgba(20,184,166,.18);color:#5eead4;">Import from old Billing Suite</button>') + '</div>';
   } else {
     h += '<p style="margin:0 0 16px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Sign in with your Google account, then connect a Firebase project you own or are authorized to use. Every customer connects their own project and keeps their data separate.</p>';
     if(!GOOGLE_CLIENT_ID){
@@ -895,6 +957,7 @@ function gsFillModal(){
     gsSyncAll(null, false);
   };
   if(q('gs-out')) q('gs-out').onclick = function(){ gsSignOut(); };
+  if(q('gs-imp')) q('gs-imp').onclick = function(){ ibImportLegacy(q('gs-imp')); };
 }
 function gsOpenModal(){
   if(document.getElementById('gs-modal')) return;
