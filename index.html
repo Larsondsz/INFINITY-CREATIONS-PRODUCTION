@@ -78,6 +78,23 @@ html.ws-gate body > *:not(#ws-picker):not(#ib-auth):not(#gs-modal):not(#gs-banne
     var go = function(){ bpPickWorkspace(id); };
     try{ LDB.ref('ib_meta/workspaces/'+id).set(name).then(go, go); }catch(e){ go(); }
   }
+  async function bpDeleteWorkspace(id){
+    var nm = WORKSPACES[id] || id;
+    if(Object.keys(WORKSPACES).length <= 1){ alert('Kam se kam ek workplace rehna chahiye.'); return; }
+    if(!confirm('"' + nm + '" workplace aur uska saara data is app se (aur synced account se) DELETE ho jayega.\n\nOld Billing Suite ka Firebase node companies/' + id + ' ko ye nahi chhuega.\n\nPakka delete karein?')) return;
+    if((prompt('Confirm ke liye workplace ka naam likho:\n' + nm, '') || '').trim().toLowerCase() !== nm.toLowerCase()){ alert('Naam match nahi hua - delete cancel.'); return; }
+    try{
+      localStorage.setItem('ib_live:' + id, '0');
+      var sk = JSON.parse(localStorage.getItem('ib_ws_skip') || '[]') || []; if(sk.indexOf(id) < 0) sk.push(id);
+      localStorage.setItem('ib_ws_skip', JSON.stringify(sk));
+      await LDB.ready;
+      await LDB.ref('companies/' + id).remove();
+      await LDB.ref('ib_meta/workspaces/' + id).remove();
+    }catch(e){ alert('Delete fail hua: ' + (e.message || e)); return; }
+    delete WORKSPACES[id];
+    try{ localStorage.setItem('ib_workspaces', JSON.stringify(WORKSPACES)); if(localStorage.getItem('bp_last_workspace') === id) localStorage.removeItem('bp_last_workspace'); }catch(e){}
+    location.reload();
+  }
   const IB_SIGNED_IN = (function(){ try{ return localStorage.getItem('ib_g_on')==='1'; }catch(e){ return false; } })();
   let WS_ID = null;
   if(IB_SIGNED_IN){ try{ WS_ID = sessionStorage.getItem('bp_workspace'); }catch(e){} }
@@ -117,6 +134,7 @@ html.ws-gate body > *:not(#ws-picker):not(#ib-auth):not(#gs-modal):not(#gs-banne
       + '<div class="wp-cards">'
       + keys.map(function(k, i){
           return '<button type="button" class="wp-card '+(CLS[k]||'ent')+'" data-ws="'+k+'"><div class="wp-row"><div class="wp-ic">'+(ICONS[k]||ICONS['workplace-1'])+'</div><span class="wp-badge'+(last===k?' show':'')+'">Last used</span></div>'
+            + '<span role="button" data-del="'+k+'" title="Delete this workplace" style="position:absolute;right:62px;bottom:18px;font-size:12px;padding:4px 10px;border-radius:8px;background:rgba(239,68,68,.15);color:#fca5a5;cursor:pointer;z-index:2;">Delete</span>'
             + '<h2>'+WORKSPACES[k]+'</h2><p class="wp-desc">GST tax invoices, product catalogue, customers, purchases and costing.</p>'
             + '<div class="wp-chips">'+CHIPS.map(function(c){ return '<span>'+c+'</span>'; }).join('')+'</div>'
             + '<div class="wp-cta"><span class="wp-go">Open workplace '+ARROW+'</span><kbd>'+(i+1)+'</kbd></div></button>';
@@ -126,7 +144,7 @@ html.ws-gate body > *:not(#ws-picker):not(#ib-auth):not(#gs-modal):not(#gs-banne
       + '<div class="wp-foot"><span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Stored locally · Google sync optional</span>'
       + '<span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Works fully offline</span>'
       + '<span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Separate data per business</span></div>';
-    d.addEventListener('click', function(e){ if(e.target.closest('button[data-add]')){ bpAddWorkspace(); return; } var b = e.target.closest('button[data-ws]'); if(b) bpPickWorkspace(b.dataset.ws); });
+    d.addEventListener('click', function(e){ var x = e.target.closest('[data-del]'); if(x){ e.stopPropagation(); bpDeleteWorkspace(x.dataset.del); return; } if(e.target.closest('button[data-add]')){ bpAddWorkspace(); return; } var b = e.target.closest('button[data-ws]'); if(b) bpPickWorkspace(b.dataset.ws); });
     document.body.appendChild(d);
     function tick(){
       var t = new Date(), h = t.getHours();
@@ -657,6 +675,7 @@ async function ibImportLegacy(btn){
 }
 /* ===================== Live two-way link with the old Billing Suite (Firebase companies/<id>/data) =====================
    Edit here -> written to Firebase within ~2s. Edit in Firebase / old app -> streamed here instantly. */
+try{ document.title = document.title.replace(/ \u2022 live v2$/, '') + ' \u2022 live v2'; }catch(e){}
 const IBL = { on:false, last:{}, es:null, timer:null, busy:false, applying:false, state:'' };
 function iblBase(){ return 'companies/' + WS_KEY + '/data'; }
 function iblFlag(){ return !!gsLS.get('ib_fb_dburl') && gsLS.get('ib_live:' + WS_KEY) !== '0'; }
@@ -766,10 +785,12 @@ LDB.onChange(function(){ if(IBL.on && !IBL.applying) iblSoon(); });
 async function ibAutoImport(){
   await LDB.ready;
   const ids = Object.keys((await ibLegacyRaw('companies', '&shallow=true')) || {}).filter(function(i){ return /^[\w.-]+$/.test(i); });
+  IBL.ids = ids; let skip = []; try{ skip = JSON.parse(gsLS.get('ib_ws_skip') || '[]') || []; }catch(e){}
   let names = {}; try{ names = JSON.parse(gsLS.get('ib_workspaces') || '{}') || {}; }catch(e){}
   if(!Object.keys(names).length) names = { 'workplace-1': 'My Workplace' };
   let n = 0;
   for(const id of ids){
+    if(skip.indexOf(id) >= 0) continue;
     const have = await LDB.ref('companies/' + id + '/data').get();
     if(have.exists()){
       if(!names[id]){ names[id] = ibLegacyGuessName(id); await LDB.ref('ib_meta/workspaces/' + id).set(names[id]); n++; }
@@ -1043,7 +1064,7 @@ async function gsFinishSignIn(tokenRequest){
       throw new Error(m);
     }
     gsFirebaseStage('Importing all your data…');
-    try{ await ibAutoImport(); }catch(e){ console.error('Auto import', e); }
+    try{ const n = await ibAutoImport(); alert('Firebase project: ' + pid + '\nOld workplaces found in "companies": ' + ((IBL.ids || []).join(', ') || 'NONE') + '\nNewly imported: ' + n); }catch(e){ console.error('Auto import', e); alert('Auto import failed: ' + (e.message || e)); }
     try{ sessionStorage.setItem('bp_stay_picker', '1'); sessionStorage.removeItem('bp_workspace'); }catch(e){}
     location.reload();
   } catch(e) {
