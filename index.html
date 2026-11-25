@@ -740,10 +740,19 @@ function gsArmReconnect(){
   };
   document.addEventListener('pointerdown', h, true);
 }
-async function gsSignIn(){
+function gsSignIn(){
+  // IMPORTANT: requestAccessToken must be called synchronously from the user's
+  // click handler. Awaiting gsInitClient() first can lose browser user activation
+  // and cause the Google account popup to be blocked or never appear.
+  if(!GS.tc){
+    return Promise.reject(new Error('Google sign-in is still loading. Wait a moment, then click Continue with Firebase again.'));
+  }
+  const tokenRequest = gsRequestToken('select_account');
+  return gsFinishSignIn(tokenRequest);
+}
+async function gsFinishSignIn(tokenRequest){
   const prevEmail = gsLS.get('ib_g_email'), prevProj = gsLS.get('ib_fb_project');
-  await gsInitClient();
-  await gsRequestToken('select_account');            // Google account chooser popup - pick any account
+  await tokenRequest;                              // popup was launched directly by the click
   const uj = await (await gsApi('https://www.googleapis.com/oauth2/v3/userinfo')).json();
   const email = uj.email || '', uid = uj.sub || '';
   if(!uid) throw new Error('Could not read your Google account.');
