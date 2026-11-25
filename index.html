@@ -655,6 +655,152 @@ async function ibImportLegacy(btn){
     say(label);
   }
 }
+/* ===================== Live two-way link with the old Billing Suite (Firebase companies/<id>/data) =====================
+   Edit here -> written to Firebase within ~2s. Edit in Firebase / old app -> streamed here instantly. */
+const IBL = { on:false, last:{}, es:null, timer:null, busy:false, applying:false, state:'' };
+function iblBase(){ return 'companies/' + WS_KEY + '/data'; }
+function iblFlag(){ return !!gsLS.get('ib_fb_dburl') && gsLS.get('ib_live:' + WS_KEY) !== '0'; }
+function iblLabel(){ return iblFlag() ? ('Live link: ON' + (IBL.state === 'error' ? ' (error)' : '')) : 'Live link with old app: OFF'; }
+function iblState(s){ IBL.state = s; const b = document.getElementById('gs-live'); if(b) b.textContent = iblLabel(); }
+function iblCanon(v){
+  if(v === null || v === undefined) return undefined;
+  if(Array.isArray(v)){ const a = v.map(iblCanon); return a.every(function(x){ return x === undefined; }) ? undefined : a.map(function(x){ return x === undefined ? null : x; }); }
+  if(typeof v === 'object'){ const o = {}; Object.keys(v).sort().forEach(function(k){ const c = iblCanon(v[k]); if(c !== undefined) o[k] = c; }); return Object.keys(o).length ? o : undefined; }
+  return v;
+}
+function iblStr(v){ const c = iblCanon(v); return c === undefined ? 'null' : JSON.stringify(c); }
+async function iblUrl(key){
+  const url = (gsLS.get('ib_fb_dburl') || '').replace(/\/$/, '');
+  if(!url) throw new Error('Firebase project connected nahi hai');
+  const t = await gsEnsureToken();
+  return url + '/' + iblBase() + (key ? '/' + encodeURIComponent(key) : '') + '.json?access_token=' + encodeURIComponent(t);
+}
+function iblFail(e){
+  console.error('Live link', e); iblState('error');
+  if(/expired|sign in|popup|access_denied|interaction|cancel|closed/i.test((e && e.message) || '')) gsArmReconnect();
+}
+async function iblApply(key, rv){
+  const js = iblStr(rv);
+  if(IBL.last[key] === js) return false;
+  IBL.last[key] = js;
+  const path = iblBase() + '/' + key;
+  const lv = (await LDB.ref(path).get()).val();
+  if(iblStr(lv) === js) return false;
+  IBL.applying = true;
+  try{ if(js === 'null') await LDB.ref(path).remove(); else await LDB.ref(path).set(rv); }
+  finally{ IBL.applying = false; iblSoon(); }
+  return true;
+}
+async function iblPush(){
+  if(!IBL.on || IBL.busy || IBL.applying) return;
+  IBL.busy = true;
+  try{
+    const cur = (await LDB.ref(iblBase()).get()).val() || {};
+    const keys = new Set(Object.keys(cur).concat(Object.keys(IBL.last)));
+    for(const k of keys){
+      const s = iblStr(cur[k]);
+      if(IBL.last[k] === undefined && s === 'null') continue;
+      if(IBL.last[k] === s) continue;
+      const r = await fetch(await iblUrl(k), s === 'null' ? { method:'DELETE' } : { method:'PUT', body: JSON.stringify(cur[k]) });
+      if(!r.ok) throw new Error('Firebase error ' + r.status);
+      IBL.last[k] = s;
+    }
+    iblState('ok');
+  }catch(e){ iblFail(e); setTimeout(iblSoon, 15000); }
+  finally{ IBL.busy = false; }
+}
+function iblSoon(){ if(!IBL.on) return; clearTimeout(IBL.timer); IBL.timer = setTimeout(iblPush, 1500); }
+async function iblStream(){
+  if(!IBL.on) return;
+  try{
+    if(IBL.es){ try{ IBL.es.close(); }catch(e){} }
+    const es = new EventSource(await iblUrl('')); IBL.es = es;
+    const handle = async function(ev){
+      let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
+      if(!m || typeof m.path !== 'string') return;
+      let changed = false;
+      try{
+        if(m.path === '/'){
+          const d = (m.data && typeof m.data === 'object') ? m.data : {};
+          if(ev.type === 'put'){
+            if(m.data === null && Object.keys(IBL.last).length) return; // never wipe local data because remote looks empty
+            const ks = new Set(Object.keys(d).concat(Object.keys(IBL.last)));
+            for(const k of ks){ if(await iblApply(k, d[k] === undefined ? null : d[k])) changed = true; }
+          } else { for(const k of Object.keys(d)){ if(await iblApply(k, d[k])) changed = true; } }
+        } else {
+          const k = m.path.split('/')[1];
+          const rv = await (await fetch(await iblUrl(k))).json();
+          if(await iblApply(k, rv)) changed = true;
+        }
+      }catch(e){ iblFail(e); return; }
+      iblState('ok');
+      if(changed){ if(document.hidden) location.reload(); else gsBanner('Firebase / old app se naya data aaya.'); }
+    };
+    es.addEventListener('put', handle); es.addEventListener('patch', handle);
+    es.addEventListener('auth_revoked', function(){ es.close(); iblFail(new Error('Google session expired')); });
+    es.addEventListener('cancel', function(){ es.close(); iblFail(new Error('Firebase permission denied')); });
+    es.onerror = function(){ if(es.readyState === 2) iblState('error'); };
+  }catch(e){ iblFail(e); }
+}
+async function iblStartLink(mode){
+  IBL.on = true; IBL.last = {};
+  try{
+    if(mode === 'push'){
+      const rem = (await (await fetch(await iblUrl(''))).json()) || {};
+      const cur = (await LDB.ref(iblBase()).get()).val() || {};
+      Object.keys(cur).forEach(function(k){ if(rem[k] !== undefined) IBL.last[k] = iblStr(rem[k]); });
+      await iblPush();
+    }
+    await iblStream();
+  }catch(e){ iblFail(e); }
+}
+function iblStop(){ IBL.on = false; clearTimeout(IBL.timer); if(IBL.es){ try{ IBL.es.close(); }catch(e){} IBL.es = null; } IBL.last = {}; iblState(''); }
+async function ibToggleLive(btn){
+  if(!WS_ID){ alert('Pehle koi workplace kholo.'); return; }
+  if(iblFlag()){ gsLS.set('ib_live:' + WS_KEY, '0'); iblStop(); btn.textContent = iblLabel(); return; }
+  gsLS.set('ib_live:' + WS_KEY, '1'); btn.textContent = 'Linking…';
+  await iblStartLink(null); btn.textContent = iblLabel();
+}
+LDB.onChange(function(){ if(IBL.on && !IBL.applying) iblSoon(); });
+
+async function ibAutoImport(){
+  await LDB.ready;
+  const ids = Object.keys((await ibLegacyRaw('companies', '&shallow=true')) || {}).filter(function(i){ return /^[\w.-]+$/.test(i); });
+  let names = {}; try{ names = JSON.parse(gsLS.get('ib_workspaces') || '{}') || {}; }catch(e){}
+  if(!Object.keys(names).length) names = { 'workplace-1': 'My Workplace' };
+  let n = 0;
+  for(const id of ids){
+    const have = await LDB.ref('companies/' + id + '/data').get();
+    if(have.exists()){
+      if(!names[id]){ names[id] = ibLegacyGuessName(id); await LDB.ref('ib_meta/workspaces/' + id).set(names[id]); n++; }
+      continue;
+    }
+    const node = await ibLegacyRaw('companies/' + encodeURIComponent(id));
+    if(!node || typeof node !== 'object') continue;
+    const data = (node.data && typeof node.data === 'object') ? node.data : node;
+    const keys = Object.keys(data); if(!keys.length) continue;
+    for(const k of keys) await LDB.ref('companies/' + id + '/data/' + k).set(data[k]);
+    if(!names[id]) names[id] = ibLegacyGuessName(id);
+    await LDB.ref('ib_meta/workspaces/' + id).set(names[id]);
+    n++;
+  }
+  gsLS.set('ib_workspaces', JSON.stringify(names));
+  if(n) await gsSyncAll(null, false);
+  return n;
+}
+function iblTick(){
+  if(gsReady() && gsLS.get('ib_fb_dburl') && !IBL.imp){
+    IBL.imp = true;
+    ibAutoImport().then(function(n){
+      if(n){ try{ sessionStorage.setItem('bp_stay_picker', '1'); sessionStorage.removeItem('bp_workspace'); }catch(e){} location.reload(); }
+    }).catch(function(e){ console.error('Auto import', e); IBL.imp = false; });
+  }
+  if(!iblFlag() || !WS_ID || !gsReady()) return;
+  if(!IBL.on) iblStartLink(null);
+  else if(!IBL.es || IBL.es.readyState === 2) iblStream();
+}
+LDB.ready.then(function(){ setTimeout(iblTick, 3000); setInterval(iblTick, 20000); });
+
 async function fbListProjects(){
   let out = [], pt = '';
   do{
@@ -814,7 +960,7 @@ async function gsSyncAll(only, auto){
       const next = Object.assign({}, cur, w);
       if(JSON.stringify(next) !== JSON.stringify(cur) || !gsLS.get('ib_workspaces')){ gsLS.set('ib_workspaces', JSON.stringify(next)); wsChanged = Object.keys(next).length !== Object.keys(cur).length; }
     }catch(e){}
-    GS.last = Date.now(); gsLS.set('ib_g_last', String(GS.last)); gsSetState('ok');
+    GS.last = Date.now(); gsLS.set('ib_g_last', String(GS.last)); gsSetState('ok'); if(typeof iblTick === 'function') setTimeout(iblTick, 500);
     const mine = changed.some(function(fk){ return fk === 'ws.' + WS_KEY || fk === 'ws.' + WS_KEY + '.files'; });
     if(!WS_ID && (wsChanged || changed.length)){ location.reload(); return; }
     if(mine){ if(!auto){ location.reload(); return; } gsBanner('Updated from your Google account.'); }
@@ -896,6 +1042,9 @@ async function gsFinishSignIn(tokenRequest){
       gsLS.del('ib_g_on');
       throw new Error(m);
     }
+    gsFirebaseStage('Importing all your data…');
+    try{ await ibAutoImport(); }catch(e){ console.error('Auto import', e); }
+    try{ sessionStorage.setItem('bp_stay_picker', '1'); sessionStorage.removeItem('bp_workspace'); }catch(e){}
     location.reload();
   } catch(e) {
     gsLS.del('ib_g_on');
@@ -929,7 +1078,7 @@ function gsFillModal(){
     h += '<p style="margin:0 0 14px;font-size:16px;font-weight:600;">' + (email || 'Google account') + '</p>';
     h += '<p style="margin:0 0 18px;color:#aab3cf;font-size:13px;line-height:1.55;">' + (fbMissing ? 'Firebase project is not connected on this device. Click <b>Reconnect Firebase</b> and choose your project.' : 'Your data is saved in your Firebase project (' + gsEsc(gsLS.get('ib_fb_project') || '') + ')' + ' and merged across every device you sign in on.') + (last ? '<br>Last sync: ' + new Date(last).toLocaleString('en-IN') : '') + '</p>';
     if(GS.state === 'error' || GS.state === 'reconnect') h += '<p style="margin:0 0 14px;color:#fca5a5;font-size:13px;">' + (GS.msg || 'Click Sync now to reconnect.') + '</p>';
-    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">' + (fbMissing ? 'Reconnect Firebase' : 'Sync now') + '</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button>' + (fbMissing ? '' : '<button id="gs-imp" style="' + btn + 'background:rgba(20,184,166,.18);color:#5eead4;">Import from old Billing Suite</button>') + '</div>';
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;"><button id="gs-sync" style="' + btn + 'background:#6366f1;color:#fff;">' + (fbMissing ? 'Reconnect Firebase' : 'Sync now') + '</button><button id="gs-out" style="' + btn + 'background:rgba(255,255,255,.08);color:#e8ecf6;">Sign out</button>' + (fbMissing ? '' : '<button id="gs-imp" style="' + btn + 'background:rgba(20,184,166,.18);color:#5eead4;">Import from old Billing Suite</button>' + '<button id="gs-live" style="' + btn + 'background:rgba(245,158,11,.18);color:#fcd34d;">' + iblLabel() + '</button>') + '</div>';
   } else {
     h += '<p style="margin:0 0 16px;color:#aab3cf;font-size:13.5px;line-height:1.55;">Sign in with your Google account, then connect a Firebase project you own or are authorized to use. Every customer connects their own project and keeps their data separate.</p>';
     if(!GOOGLE_CLIENT_ID){
@@ -958,6 +1107,7 @@ function gsFillModal(){
   };
   if(q('gs-out')) q('gs-out').onclick = function(){ gsSignOut(); };
   if(q('gs-imp')) q('gs-imp').onclick = function(){ ibImportLegacy(q('gs-imp')); };
+  if(q('gs-live')) q('gs-live').onclick = function(){ ibToggleLive(q('gs-live')); };
 }
 function gsOpenModal(){
   if(document.getElementById('gs-modal')) return;
