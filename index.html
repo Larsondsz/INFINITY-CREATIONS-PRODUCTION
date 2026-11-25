@@ -594,7 +594,19 @@ async function fbFindDb(project, token){
   let instances = [], pageToken = '';
   do{
     const endpoint = url + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');
-    const r = await fetch(endpoint, { headers:{ Authorization:'Bearer ' + token } });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(function(){ controller.abort(); }, 20000);
+    let r;
+    try {
+      r = await fetch(endpoint, { headers:{ Authorization:'Bearer ' + token }, signal:controller.signal });
+    } catch(fetchError) {
+      if(fetchError && fetchError.name === 'AbortError') {
+        throw new Error('Firebase database lookup timed out for "' + projectId + '". Check your connection and try again.');
+      }
+      throw new Error('Could not reach Firebase Database API: ' + (fetchError.message || String(fetchError)));
+    } finally {
+      clearTimeout(timeoutId);
+    }
     if(!r.ok){
       const body = await r.text();
       if(r.status === 403) throw new Error('Google account can see project "' + projectId + '", but cannot list its Realtime Database. Check Realtime Database API access for this account.');
@@ -740,6 +752,11 @@ function gsArmReconnect(){
   };
   document.addEventListener('pointerdown', h, true);
 }
+function gsFirebaseStage(message){
+  const b = document.getElementById('ib-firebase');
+  const span = b && b.querySelector('span');
+  if(span) span.textContent = message;
+}
 function gsSignIn(){
   // IMPORTANT: requestAccessToken must be called synchronously from the user's
   // click handler. Awaiting gsInitClient() first can lose browser user activation
@@ -752,22 +769,40 @@ function gsSignIn(){
 }
 async function gsFinishSignIn(tokenRequest){
   const prevEmail = gsLS.get('ib_g_email'), prevProj = gsLS.get('ib_fb_project');
-  await tokenRequest;                              // popup was launched directly by the click
-  const uj = await (await gsApi('https://www.googleapis.com/oauth2/v3/userinfo')).json();
-  const email = uj.email || '', uid = uj.sub || '';
-  if(!uid) throw new Error('Could not read your Google account.');
-  const projects = await fbListProjects();
-  if(!projects.length) throw new Error('No Firebase project found in ' + email + '. Create one in Firebase Console first.');
-  const selectedProject = await gsPickProject(projects);
-  const pid = selectedProject.projectId;
-  const dbUrl = await fbFindDb(selectedProject, GS.token);
-  if((email && prevEmail && prevEmail !== email) || (prevProj && prevProj !== pid)){ Object.keys(localStorage).filter(function(k){ return k.indexOf('ib_synced:') === 0; }).forEach(gsLS.del); }
-  gsLS.set('ib_fb_project', pid); gsLS.set('ib_fb_dburl', dbUrl); gsLS.set('ib_g_uid', uid);
-  gsLS.set('ib_backend', 'firebase'); gsLS.set('ib_g_on', '1'); gsLS.set('ib_g_email', email);
-  gsSetState('syncing');
-  await gsSyncAll(null, false);
-  if(GS.state !== 'ok'){ const m = GS.msg || 'Could not connect to your Firebase database.'; gsLS.del('ib_g_on'); throw new Error(m); }
-  location.reload();
+  try {
+    gsFirebaseStage('Waiting for Google authorization…');
+    await tokenRequest;
+    gsFirebaseStage('Reading Google account…');
+    const userResponse = await gsApi('https://www.googleapis.com/oauth2/v3/userinfo');
+    const uj = await userResponse.json();
+    const email = uj.email || '', uid = uj.sub || '';
+    if(!uid) throw new Error('Could not read your Google account.');
+    gsFirebaseStage('Loading your Firebase projects…');
+    const projects = await fbListProjects();
+    if(!projects.length) throw new Error('No Firebase project found in ' + email + '. Create one in Firebase Console first.');
+    gsFirebaseStage('Select your Firebase project…');
+    const selectedProject = await gsPickProject(projects);
+    const pid = selectedProject.projectId;
+    gsFirebaseStage('Finding Realtime Database…');
+    const dbUrl = await fbFindDb(selectedProject, GS.token);
+    if((email && prevEmail && prevEmail !== email) || (prevProj && prevProj !== pid)){
+      Object.keys(localStorage).filter(function(k){ return k.indexOf('ib_synced:') === 0; }).forEach(gsLS.del);
+    }
+    gsLS.set('ib_fb_project', pid); gsLS.set('ib_fb_dburl', dbUrl); gsLS.set('ib_g_uid', uid);
+    gsLS.set('ib_backend', 'firebase'); gsLS.set('ib_g_on', '1'); gsLS.set('ib_g_email', email);
+    gsSetState('syncing');
+    gsFirebaseStage('Syncing your billing data…');
+    await gsSyncAll(null, false);
+    if(GS.state !== 'ok'){
+      const m = GS.msg || 'Could not connect to your Firebase database.';
+      gsLS.del('ib_g_on');
+      throw new Error(m);
+    }
+    location.reload();
+  } catch(e) {
+    gsLS.del('ib_g_on');
+    throw e;
+  }
 }
 async function gsSignOut(){
   if(!confirm('Sign out? Your data stays safe in your Google account and comes back when you sign in again. Anything not yet synced from this device will be lost.')) return;
