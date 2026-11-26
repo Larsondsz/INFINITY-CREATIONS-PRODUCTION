@@ -67,6 +67,7 @@ html.ws-gate body > *:not(#ws-picker):not(#ib-auth):not(#gs-modal):not(#gs-banne
   /* ---------- Workspaces ---------- */
   let WORKSPACES = { 'workplace-1':'My Workplace' };
   try{ var _w = JSON.parse(localStorage.getItem('ib_workspaces')||'null'); if(_w && typeof _w==='object' && Object.keys(_w).length) WORKSPACES = _w; }catch(e){}
+  try{ var _sk = JSON.parse(localStorage.getItem('ib_ws_skip')||'[]')||[]; _sk.forEach(function(k){ if(WORKSPACES[k] && Object.keys(WORKSPACES).length>1) delete WORKSPACES[k]; }); }catch(e){}
   function bpAddWorkspace(){
     var name = (prompt('Name of the new workplace:','')||'').trim();
     if(!name) return;
@@ -78,23 +79,18 @@ html.ws-gate body > *:not(#ws-picker):not(#ib-auth):not(#gs-modal):not(#gs-banne
     var go = function(){ bpPickWorkspace(id); };
     try{ LDB.ref('ib_meta/workspaces/'+id).set(name).then(go, go); }catch(e){ go(); }
   }
-  async function bpDeleteWorkspace(id){
+  function bpDeleteWorkspace(id){
     var nm = WORKSPACES[id] || id;
-    if(Object.keys(WORKSPACES).length <= 1){ alert('Kam se kam ek workplace rehna chahiye.'); return; }
-    if(!confirm('"' + nm + '" workplace aur uska saara data is app se (aur synced account se) DELETE ho jayega.\n\nOld Billing Suite ka Firebase node companies/' + id + ' ko ye nahi chhuega.\n\nPakka delete karein?')) return;
-    if((prompt('Confirm ke liye workplace ka naam likho:\n' + nm, '') || '').trim().toLowerCase() !== nm.toLowerCase()){ alert('Naam match nahi hua - delete cancel.'); return; }
+    if(Object.keys(WORKSPACES).length <= 1){ alert('Kam se kam ek workplace dikhna chahiye.'); return; }
+    if(!confirm('"' + nm + '" ko is list se hide karein?\n\nData kahin se DELETE nahi hoga (na is app mein, na Firebase / synced account mein). Baad mein "Show hidden workplaces" se wapas la sakte ho.')) return;
     try{
       localStorage.setItem('ib_live:' + id, '0');
       var sk = JSON.parse(localStorage.getItem('ib_ws_skip') || '[]') || []; if(sk.indexOf(id) < 0) sk.push(id);
       localStorage.setItem('ib_ws_skip', JSON.stringify(sk));
-      await LDB.ready;
-      await LDB.ref('companies/' + id).remove();
-      await LDB.ref('ib_meta/workspaces/' + id).remove();
-    }catch(e){ alert('Delete fail hua: ' + (e.message || e)); return; }
-    delete WORKSPACES[id];
-    try{ localStorage.setItem('ib_workspaces', JSON.stringify(WORKSPACES)); if(localStorage.getItem('bp_last_workspace') === id) localStorage.removeItem('bp_last_workspace'); }catch(e){}
+    }catch(e){}
     location.reload();
   }
+  function bpUnhideWorkspaces(){ try{ localStorage.removeItem('ib_ws_skip'); }catch(e){} location.reload(); }
   const IB_SIGNED_IN = (function(){ try{ return localStorage.getItem('ib_g_on')==='1'; }catch(e){ return false; } })();
   let WS_ID = null;
   if(IB_SIGNED_IN){ try{ WS_ID = sessionStorage.getItem('bp_workspace'); }catch(e){} }
@@ -134,17 +130,17 @@ html.ws-gate body > *:not(#ws-picker):not(#ib-auth):not(#gs-modal):not(#gs-banne
       + '<div class="wp-cards">'
       + keys.map(function(k, i){
           return '<button type="button" class="wp-card '+(CLS[k]||'ent')+'" data-ws="'+k+'"><div class="wp-row"><div class="wp-ic">'+(ICONS[k]||ICONS['workplace-1'])+'</div><span class="wp-badge'+(last===k?' show':'')+'">Last used</span></div>'
-            + '<span role="button" data-del="'+k+'" title="Delete this workplace" style="position:absolute;right:62px;bottom:18px;font-size:12px;padding:4px 10px;border-radius:8px;background:rgba(239,68,68,.15);color:#fca5a5;cursor:pointer;z-index:2;">Delete</span>'
+            + '<span role="button" data-del="'+k+'" title="Hide this workplace (data is not deleted)" style="position:absolute;right:62px;bottom:18px;font-size:12px;padding:4px 10px;border-radius:8px;background:rgba(239,68,68,.15);color:#fca5a5;cursor:pointer;z-index:2;">Hide</span>'
             + '<h2>'+WORKSPACES[k]+'</h2><p class="wp-desc">GST tax invoices, product catalogue, customers, purchases and costing.</p>'
             + '<div class="wp-chips">'+CHIPS.map(function(c){ return '<span>'+c+'</span>'; }).join('')+'</div>'
             + '<div class="wp-cta"><span class="wp-go">Open workplace '+ARROW+'</span><kbd>'+(i+1)+'</kbd></div></button>';
         }).join('')
       + '<button type="button" class="wp-card" data-add="1" style="display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;min-height:260px;border-style:dashed;"><div class="wp-ic" style="font-size:30px;color:#fff;">+</div><h2>Add workplace</h2><p class="wp-desc">Create another business with its own separate data.</p></button>'
-      + '</div></div>'
+      + '</div>' + (function(){ var n = 0; try{ n = (JSON.parse(localStorage.getItem('ib_ws_skip')||'[]')||[]).length; }catch(e){} return n ? '<div style="text-align:center;margin-top:18px;"><span role="button" data-unhide="1" style="cursor:pointer;color:#8d97b5;font-size:13px;text-decoration:underline;">Show ' + n + ' hidden workplace(s)</span></div>' : ''; })() + '</div>'
       + '<div class="wp-foot"><span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Stored locally · Google sync optional</span>'
       + '<span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Works fully offline</span>'
       + '<span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Separate data per business</span></div>';
-    d.addEventListener('click', function(e){ var x = e.target.closest('[data-del]'); if(x){ e.stopPropagation(); bpDeleteWorkspace(x.dataset.del); return; } if(e.target.closest('button[data-add]')){ bpAddWorkspace(); return; } var b = e.target.closest('button[data-ws]'); if(b) bpPickWorkspace(b.dataset.ws); });
+    d.addEventListener('click', function(e){ if(e.target.closest('[data-unhide]')){ bpUnhideWorkspaces(); return; } var x = e.target.closest('[data-del]'); if(x){ e.stopPropagation(); bpDeleteWorkspace(x.dataset.del); return; } if(e.target.closest('button[data-add]')){ bpAddWorkspace(); return; } var b = e.target.closest('button[data-ws]'); if(b) bpPickWorkspace(b.dataset.ws); });
     document.body.appendChild(d);
     function tick(){
       var t = new Date(), h = t.getHours();
@@ -820,6 +816,8 @@ function iblTick(){
   if(!IBL.on) iblStartLink(null);
   else if(!IBL.es || IBL.es.readyState === 2) iblStream();
 }
+/* Preload Google sign-in so the login popup opens straight from the click (otherwise browsers block it) */
+try{ gsInitClient().catch(function(e){ console.warn('Google preload', e); }); }catch(e){}
 LDB.ready.then(function(){ setTimeout(iblTick, 3000); setInterval(iblTick, 20000); });
 
 async function fbListProjects(){
